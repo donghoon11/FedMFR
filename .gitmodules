@@ -1,0 +1,3 @@
+[submodule "SMCAD"]
+	path = SMCAD
+	url = https://github.com/donghoon11/SMCAD.git
