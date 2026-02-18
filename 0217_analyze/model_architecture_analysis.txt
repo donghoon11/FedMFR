@@ -1,0 +1,313 @@
+==============================================================================
+FedMFR GNN 모델 아키텍처 분석
+==============================================================================
+분석일: 2026-02-17
+대상: /home/oh/pyocc/0_refactoring/FedMFR/
+
+==============================================================================
+1. 전체 파일 목록 (22개 Python 파일)
+==============================================================================
+
+Pre-train_Exp/ (사전학습)
+  ├── models.py                  -- 핵심 모델 정의 (SMNetEncoder, Classifier)
+  ├── pretrain-smcad.py          -- SMCAD 데이터셋 사전학습 스크립트
+  ├── pretrain-mfcad.py          -- MFCAD++ 데이터셋 사전학습 스크립트
+  └── pretrain-mfcad-test.py     -- MFCAD++ 테스트 (no_res 모델 사용)
+
+Ablation-Comparison_Exp/ (Ablation 실험)
+  ├── models.py                  -- GINEConv 기본 모델 (Pre-train과 동일)
+  ├── models_no_res.py           -- Residual 제거 변형
+  ├── models_no_edge_attr.py     -- Edge feature 제거 변형 (GINConv 사용)
+  ├── models_gat.py              -- GATConv 대체 변형
+  ├── models_graphsage.py        -- SAGEConv 대체 변형
+  ├── models_gcn.py              -- GCNConv 대체 변형
+  ├── pretrain-mfcad.py          -- MFCAD++ 학습 (기본 모델)
+  ├── pretrain-mfcad-edge-attr.py  -- Edge feature 2D 실험
+  └── pretrain-mfcad-node-attr.py  -- Node feature 6D 실험
+
+Inc-train_Exp/ (증분학습)
+  ├── models.py                  -- 핵심 모델 (Pre-train과 동일)
+  ├── inc_train_pretrain.py      -- 순수 Fine-tuning
+  ├── inc_train_prototype.py     -- Prototype 기반 Rehearsal
+  ├── inc_train_kd.py            -- Knowledge Distillation
+  ├── inc_train_combined.py      -- 통합 데이터 학습
+  ├── inc_train_pretrain+kd.py   -- Pretrain + KD
+  ├── inc_train_prototype+pretrain.py    -- Prototype + Pretrain
+  ├── inc_train_prototype+kd.py          -- Prototype + KD
+  └── inc_train_prototype+pretrain+kd.py -- Prototype + Pretrain + KD (최종)
+
+==============================================================================
+2. 파일 의존 관계 (Dependency Graph)
+==============================================================================
+
+[공통 외부 라이브러리]
+  torch, torch.nn, torch.nn.functional
+  torch_geometric.nn: GINEConv, DeepGCNLayer, MLP
+  torch_geometric.data: Data
+  sklearn.metrics: f1_score
+  h5py, numpy, argparse
+
+[파일 간 의존 관계]
+
+Pre-train_Exp/pretrain-smcad.py
+  └── imports from: Pre-train_Exp/models.py  (from models import *)
+
+Pre-train_Exp/pretrain-mfcad.py
+  └── imports from: Pre-train_Exp/models.py
+
+Pre-train_Exp/pretrain-mfcad-test.py
+  └── imports from: Ablation-Comparison_Exp/models_no_res.py
+      (sys.path로 경로 추가)
+
+Ablation-Comparison_Exp/pretrain-mfcad*.py
+  └── imports from: Ablation-Comparison_Exp/models.py
+
+Inc-train_Exp/inc_train_*.py (8개 모두)
+  └── imports from: Inc-train_Exp/models.py
+  └── loads checkpoint: smnet_pretrain_model/<dataset>/<seed>_<epoch>.pth
+
+[핵심 포인트]
+- models.py 는 3개 디렉토리 모두에 동일한 복사본 존재
+- 모든 학습 스크립트는 로컬 models.py 를 "from models import *" 로 임포트
+- 증분학습 스크립트는 사전학습 체크포인트(.pth)를 로드하여 사용
+- 체크포인트 저장 형식:
+    {'epoch', 'encoder_state_dict', 'classifier_state_dict',
+     'optimizer_encoder_state_dict', 'optimizer_classifier_state_dict'}
+
+==============================================================================
+3. 핵심 모델 구조 상세
+==============================================================================
+
+---------- 3.1 SMNetEncoder ----------
+
+구조: GINEConv + DeepGCNLayer (Residual) x num_layers
+
+class SMNetEncoder(nn.Module):
+    __init__(in_channels=7, hidden_channels=256, num_layers=13, edge_vec_dim=3)
+
+    각 레이어 구성:
+      mlp       = MLP([in_channels, hidden_channels, hidden_channels])
+      conv      = GINEConv(nn=mlp, train_eps=True, edge_dim=edge_vec_dim)
+      norm      = LayerNorm(hidden_channels, elementwise_affine=True)
+      act       = ReLU(inplace=True)
+      layer     = DeepGCNLayer(conv, norm, act,
+                               block='res+',     # Pre-activation Residual
+                               dropout=0.2,
+                               ckpt_grad=k%3)    # 3레이어마다 Gradient Checkpointing
+
+    forward(feature_vector, adj_index, edge_vector):
+      1) x = layers[0].conv(feature_vector, adj_index, edge_vector)
+         → 첫 레이어는 Residual 없이 Conv만 적용
+      2) for layer in layers[1:]:
+             x = layer(x, adj_index, edge_vector)
+         → 나머지 레이어는 DeepGCNLayer 통과 (Residual + Norm + Act + Dropout)
+      3) x = layers[0].act(layers[0].norm(x))
+         → 최종 Norm + Activation
+      4) x = F.dropout(x, p=0.2, training=self.training)
+         → 최종 Dropout
+      5) return x  # shape: [N_nodes, hidden_channels]
+
+    [입출력]
+      Input:  feature_vector [N, 7], adj_index [2, E], edge_vector [E, 3]
+      Output: embedding      [N, 256]
+
+---------- 3.2 Classifier ----------
+
+class Classifier(nn.Module):
+    __init__(hidden_channels=256, class_num=24)
+
+    구조:
+      fc = Linear(hidden_channels, class_num)
+
+    forward(x):
+      return fc(x)  # [N, class_num] logits
+
+    [입출력]
+      Input:  [N, 256] embedding
+      Output: [N, 24]  logits (softmax 전)
+
+---------- 3.3 메트릭 함수 ----------
+
+accuracy(output, labels):
+  preds = output.max(1)[1]
+  correct = preds.eq(labels).sum()
+  return correct / len(labels)
+
+f1(output, labels):
+  preds = output.max(1)[1]
+  return f1_score(labels, preds, average='macro')
+
+==============================================================================
+4. GINEConv 컴포넌트 상세
+==============================================================================
+
+GINEConv (Graph Isomorphism Network with Edge features):
+  - PyG 제공 GINConv의 Edge feature 확장판
+  - 수식: x_i' = h((1+eps) * x_i + sum_{j in N(i)} relu(x_j + e_{ij}))
+    여기서 h = MLP, eps는 학습 가능 (train_eps=True)
+  - edge_dim 파라미터로 edge feature 차원 지정
+  - 내부 MLP: [in_channels → hidden_channels → hidden_channels]
+
+DeepGCNLayer:
+  - block='res+' → Pre-activation Residual: norm → act → dropout → conv → add
+  - Gradient Checkpointing: ckpt_grad=k%3 → 메모리 효율화 (13레이어 깊은 네트워크)
+  - 13층 깊은 GNN에서 Gradient Vanishing 방지
+
+LayerNorm:
+  - elementwise_affine=True → 학습 가능한 gamma, beta 파라미터
+  - 노드별 정규화
+
+==============================================================================
+5. 데이터 흐름 (Data Pipeline)
+==============================================================================
+
+[HDF5 파일 구조]
+  /{group_key}/V_1       shape (N_faces, 7)    float32  노드 피처
+  /{group_key}/A_1_idx   shape (M_edges, 2)    int64    인접 인덱스
+  /{group_key}/V_2       shape (M_edges, 3)    float32  엣지 피처
+  /{group_key}/labels    shape (N_faces,)      int64    라벨
+
+[데이터 로딩 과정]
+  1. h5py.File() → 각 그룹(=파일 1개)별로 yield
+  2. load_raw_data():
+     - node_feature → torch.float [N, 7]
+     - adj: (M,2) → transpose → [2, M] (PyG edge_index 형식)
+     - edge_feature → torch.float [M, 3]
+     - labels → torch.long [N]
+     - → Data(x, edge_index, edge_attr, y) 생성
+
+[Forward Pass 흐름]
+  HDF5 그룹 → load_raw_data() → PyG Data
+    → encoder(data.x, data.edge_index, data.edge_attr) → embedding [N, 256]
+    → classifier(embedding) → logits [N, 24]
+    → F.log_softmax(logits, dim=1) → log_prob [N, 24]
+    → F.nll_loss(log_prob, labels) → scalar loss
+    → backward() → step()
+
+==============================================================================
+6. 학습 설정 및 하이퍼파라미터
+==============================================================================
+
+---------- 6.1 사전학습 (Pre-training) ----------
+
+                    SMCAD           MFCAD++
+  Epochs:           50              1000
+  Learning Rate:    5e-4            5e-4
+  Weight Decay:     5e-4            5e-4
+  Hidden Dim:       256             256
+  Num Layers:       13              13
+  Node Feature Dim: 7               7
+  Edge Feature Dim: 3               3
+  Dropout:          0.2             0.2
+  Seed:             1234            1234
+  Optimizer:        Adam (enc+cls 별도)
+  Loss:             NLL Loss (log_softmax + nll_loss)
+  클래스 수:        24 (13+11)      30
+
+---------- 6.2 증분학습 (Incremental Training) ----------
+
+  Epochs:           100
+  LR (encoder):     0.0005 (사전학습의 절반)
+  LR (classifier):  0.001
+  Weight Decay:     5e-4
+  Old Classes:      13
+  New Classes:      11
+  Total Classes:    24
+
+---------- 6.3 Knowledge Distillation ----------
+
+  Temperature (T):  2
+  Alpha (blend):    0.5
+  Loss = NLL_loss + alpha * KL_div(student, teacher) * T^2
+
+---------- 6.4 모델 저장 형식 ----------
+
+  체크포인트 경로: smnet_pretrain_model/<dataset>/<seed>_<epoch>.pth
+  저장 내용:
+    {
+      'epoch': int,
+      'encoder_state_dict': state_dict,
+      'classifier_state_dict': state_dict,
+      'optimizer_encoder_state_dict': state_dict,
+      'optimizer_classifier_state_dict': state_dict
+    }
+  저장 조건: Validation Accuracy가 이전 best 이상일 때
+
+==============================================================================
+7. Ablation 모델 변형 비교
+==============================================================================
+
+  모델 파일              Conv 종류    Edge 사용  Residual  MLP
+  ─────────────────────  ──────────  ─────────  ────────  ───
+  models.py              GINEConv    O          O (res+)  O
+  models_no_res.py       GINEConv    O          X         O
+  models_no_edge_attr.py GINConv     X          O (res+)  O
+  models_gat.py          GATConv     X          O (res+)  X
+  models_graphsage.py    SAGEConv    X          O (res+)  X
+  models_gcn.py          GCNConv     X          O (res+)  X
+
+  [models_no_res.py 차이점]
+    - DeepGCNLayer 사용하지 않음
+    - 수동으로 ReLU + Dropout 적용
+    - Residual Connection 없음
+
+  [models_no_edge_attr.py 차이점]
+    - GINConv 사용 (edge_dim 파라미터 없음)
+    - forward에서 edge_vector 무시
+
+  [Ablation 피처 실험]
+    - pretrain-mfcad-edge-attr.py: edge_vec_dim=2 (3D에서 1개 제거)
+    - pretrain-mfcad-node-attr.py: fea_vec_dim=6 (7D에서 1개 제거)
+
+==============================================================================
+8. 증분학습 전략 비교 (Inc-train_Exp)
+==============================================================================
+
+  방법                     Rehearsal  KD    Pretrain   특징
+  ─────────────────────    ────────  ────  ─────────  ──────────────────
+  inc_train_pretrain       X         X     O          순수 Fine-tuning
+  inc_train_prototype      O (Proto) X     X          Prototype 거리 기반 샘플 선택
+  inc_train_kd             X         O     X          Teacher-Student 증류
+  inc_train_combined       X         X     X          Old+New 통합 학습
+  pretrain+kd              X         O     O          Fine-tune + 증류
+  prototype+pretrain       O (Proto) X     O          Proto 선택 + Fine-tune
+  prototype+kd             O (Proto) O     X          Proto 선택 + 증류
+  prototype+pretrain+kd    O (Proto) O     O          전체 조합 (최종 제안)
+
+  [Prototype 샘플링]
+    - get_prototype(): 클래스별 임베딩 평균으로 Prototype 벡터 생성
+    - sample_generator(): Prototype과 유클리드 거리 기반으로 대표 샘플 선택
+    - 선택된 Old 샘플 + New 데이터를 결합하여 학습
+
+  [Knowledge Distillation]
+    - Teacher: 사전학습된 모델 (frozen)
+    - Student: 새로운 Classifier
+    - KL Divergence with Temperature Scaling (T=2)
+    - Loss = NLL + alpha * KL_div * T^2
+
+==============================================================================
+9. 우리 프로젝트(0217)에서 사용할 부분
+==============================================================================
+
+[사용할 모델]
+  - Pre-train_Exp/models.py 의 SMNetEncoder + Classifier
+  - 변경 없이 그대로 사용 가능
+
+[사용할 학습 패턴]
+  - pretrain-smcad.py 의 학습 루프 참조
+  - 24클래스 전체에 대해 사전학습 방식으로 학습
+  - class_num = 24
+
+[입력 데이터 요구사항]
+  - Node Features (V_1): [N, 7] float32
+  - Edge Index (A_1_idx): [M, 2] int64 (양방향)
+  - Edge Features (V_2): [M, 3] float32
+  - Labels: [N] int64 (0-23)
+
+[주의사항]
+  - HDF5에서 A_1_idx는 (M,2) 형태로 저장
+  - load_raw_data()에서 transpose하여 (2,M)으로 변환 후 PyG에 전달
+  - 양방향 엣지 필요: (src,dst) + (dst,src) 모두 포함
+  - log_softmax + nll_loss 조합 사용 (cross_entropy와 동일)
+
+==============================================================================
